@@ -21,6 +21,10 @@ class App(tk.Tk):
         self.title("Sheet Printer  v%s" % __version__)
         self.geometry("1180x760")
         self.minsize(980, 640)
+        try:
+            self.state("zoomed")  # open maximised so every button is visible
+        except tk.TclError:
+            pass
         self.src = None
         self.src_path = ""
         self.out = None
@@ -30,6 +34,7 @@ class App(tk.Tk):
         self._after = None
         self._muting = False
         self.unit = "mm"
+        self.items = []  # designs for "many designs on one sheet" mode
 
         self.v = {}
         for name, default in [
@@ -37,12 +42,13 @@ class App(tk.Tk):
             ("paper_w", "210"), ("paper_h", "297"), ("margin", "10"),
             ("gap_x", "5"), ("gap_y", "5"), ("rotation", "0"),
             ("mode", "auto"), ("copies", "10"), ("columns", "0"),
-            ("center", "1"), ("crop", "1"), ("border", "0"), ("border_w", "0.3"), ("image_dpi", "300"), ("mark_len", "4"), ("mark_off", "1"),
+            ("center", "1"), ("crop", "1"), ("border", "0"), ("border_w", "0.3"), ("image_dpi", "300"), ("scale", "100"), ("mark_len", "4"), ("mark_off", "1"),
             ("unit", "mm"), ("printer", ""), ("sheet_copies", "1"),
+            ("layout", "single"), ("item_copies", "1"), ("item_scale", "100"),
         ]:
             self.v[name] = tk.StringVar(value=default)
         for name, var in self.v.items():
-            if name not in ("unit", "printer", "sheet_copies"):
+            if name not in ("unit", "printer", "sheet_copies", "item_copies", "item_scale"):
                 var.trace_add("write", lambda *a: self.schedule())
 
         self._build_ui()
@@ -66,6 +72,14 @@ class App(tk.Tk):
         self.file_lbl = ttk.Label(left, text="No file opened", wraplength=250, foreground="#555")
         self.file_lbl.grid(row=r + 1, column=0, columnspan=3, sticky="w", pady=(2, 8))
         r += 2
+        ttk.Radiobutton(left, text="One design, repeated", variable=self.v["layout"],
+                        value="single", command=self.on_layout_change).grid(
+            row=r, column=0, columnspan=3, sticky="w")
+        r += 1
+        ttk.Radiobutton(left, text="Many designs on one sheet (list)", variable=self.v["layout"],
+                        value="mix", command=self.on_layout_change).grid(
+            row=r, column=0, columnspan=3, sticky="w")
+        r += 1
 
         label("Pages (all / 1,3-5)", r)
         ttk.Entry(left, textvariable=self.v["pages"], width=14).grid(row=r, column=1, columnspan=2, sticky="w")
@@ -128,6 +142,8 @@ class App(tk.Tk):
         ttk.Entry(left, textvariable=self.v["border_w"], width=10).grid(row=r, column=1, sticky="w"); r += 1
         label("Image DPI (images only)", r)
         ttk.Entry(left, textvariable=self.v["image_dpi"], width=10).grid(row=r, column=1, sticky="w"); r += 1
+        label("Design size % (100 = original)", r)
+        ttk.Entry(left, textvariable=self.v["scale"], width=10).grid(row=r, column=1, sticky="w"); r += 1
         ttk.Checkbutton(left, text="Crop marks (drawn in the margin)", variable=self.v["crop"],
                         onvalue="1", offvalue="0").grid(row=r, column=0, columnspan=3, sticky="w"); r += 1
         label("   Mark length", r)
@@ -161,9 +177,34 @@ class App(tk.Tk):
         ttk.Button(top, text=">", width=3, command=lambda: self.nav(1)).pack(side="left")
         self.status = ttk.Label(top, text="Open a PDF to start", foreground="#555")
         self.status.pack(side="left", padx=16)
+        self._build_mix_panel(right)
         self.canvas = tk.Canvas(right, bg="#d9d9d9", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True, pady=(8, 0))
         self.canvas.bind("<Configure>", lambda e: self.draw_preview())
+
+    def _build_mix_panel(self, parent):
+        self.mix_frame = ttk.LabelFrame(parent, text="Designs on the sheet", padding=6)
+        cols = ("name", "size", "copies", "scale")
+        self.tree = ttk.Treeview(self.mix_frame, columns=cols, show="headings",
+                                 height=5, selectmode="extended")
+        for col, text, w in (("name", "Design", 300), ("size", "Size", 130),
+                             ("copies", "Copies", 70), ("scale", "Size %", 70)):
+            self.tree.heading(col, text=text)
+            self.tree.column(col, width=w, anchor="w")
+        sb = ttk.Scrollbar(self.mix_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.grid(row=0, column=0, columnspan=8, sticky="we")
+        sb.grid(row=0, column=8, sticky="ns")
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self.on_item_select())
+        ttk.Button(self.mix_frame, text="Add files...", command=self.add_files).grid(row=1, column=0, pady=4, sticky="w")
+        ttk.Button(self.mix_frame, text="Remove selected", command=self.remove_items).grid(row=1, column=1, padx=4, sticky="w")
+        ttk.Button(self.mix_frame, text="Clear all", command=self.clear_items).grid(row=1, column=2, sticky="w")
+        ttk.Label(self.mix_frame, text="Copies").grid(row=1, column=3, padx=(14, 2))
+        ttk.Entry(self.mix_frame, textvariable=self.v["item_copies"], width=6).grid(row=1, column=4)
+        ttk.Label(self.mix_frame, text="Size %").grid(row=1, column=5, padx=(8, 2))
+        ttk.Entry(self.mix_frame, textvariable=self.v["item_scale"], width=6).grid(row=1, column=6)
+        ttk.Button(self.mix_frame, text="Apply to selected", command=lambda: self.apply_items(False)).grid(row=2, column=3, columnspan=3, pady=2, sticky="we")
+        ttk.Button(self.mix_frame, text="Apply to all", command=lambda: self.apply_items(True)).grid(row=2, column=6, columnspan=2, pady=2, sticky="we")
 
     # ---------- helpers ----------
     def f(self, name):
@@ -194,6 +235,7 @@ class App(tk.Tk):
         self.unit = new
         self.unit_lbl1.config(text=new)
         self._muting = False
+        self.refresh_table()
         self.schedule()
 
     def apply_preset(self):
@@ -238,11 +280,14 @@ class App(tk.Tk):
             "crop_marks": self.v["crop"].get() == "1",
             "mark_len": self.mm("mark_len"), "mark_off": self.mm("mark_off"),
             "border": self.v["border"].get() == "1", "border_w": self.mm("border_w"),
+            "scale": float(self.v["scale"].get().replace(",", ".") or 100) / 100.0,
             "grid": None,
         }
         cols = int(float(self.v["columns"].get() or 0))
         if s["mode"] == "custom" and cols > 0:
             s["grid"] = (cols, 9999)
+        if s["scale"] <= 0:
+            raise ValueError("Design size % must be above zero")
         if s["paper_w"] <= 0 or s["paper_h"] <= 0:
             raise ValueError("Paper size must be above zero")
         if min(s["margin"], s["gap_x"], s["gap_y"]) < 0:
@@ -251,6 +296,9 @@ class App(tk.Tk):
 
     # ---------- actions ----------
     def open_pdf(self):
+        if self.v["layout"].get() == "mix":
+            self.add_files()
+            return
         path = filedialog.askopenfilename(
             title="Open PDF or image",
             filetypes=[("PDF or image", "*.pdf *.png *.jpg *.jpeg *.bmp *.tif *.tiff *.gif *.webp"),
@@ -286,6 +334,9 @@ class App(tk.Tk):
 
     def rebuild(self):
         self._after = None
+        if self.v["layout"].get() == "mix":
+            self.rebuild_mix()
+            return
         if self.src is None:
             return
         try:
@@ -305,8 +356,125 @@ class App(tk.Tk):
         txt = "%d sheet(s) total" % info["sheets"]
         d = info["details"][0]
         txt += "  |  %d copies fit per sheet (rotation %s)" % (d[1], d[3])
+        txt += "  |  design %s x %s %s" % (self.fmt(d[4]), self.fmt(d[5]), self.unit)
         if s["crop_marks"] and s["margin"] < s["mark_off"] + s["mark_len"] and not s["center"]:
             txt += "  |  Tip: margin is smaller than the crop marks"
+        self.status.config(text=txt, foreground="#555")
+        self.draw_preview()
+
+    # ---------- many designs on one sheet ----------
+    def on_layout_change(self):
+        if self.v["layout"].get() == "mix":
+            self.mix_frame.pack(side="bottom", fill="x", before=self.canvas)
+            self.refresh_table()
+        else:
+            self.mix_frame.pack_forget()
+        self.rebuild()
+
+    def add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Add PDFs or images",
+            filetypes=[("PDF or image", "*.pdf *.png *.jpg *.jpeg *.bmp *.tif *.tiff *.gif *.webp"),
+                       ("PDF files", "*.pdf"), ("Images", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.gif *.webp")])
+        if not paths:
+            return
+        for path in paths:
+            try:
+                doc = composer.open_source(path, self.image_dpi())
+                base = os.path.basename(path)
+                if composer.is_image(path):
+                    self.items.append({"name": base, "path": path, "page": 0, "doc": doc,
+                                       "is_image": True, "copies": 1, "scale": 1.0})
+                else:
+                    for pi in g.parse_pages(self.v["pages"].get(), len(doc)):
+                        name = base if len(doc) == 1 else "%s  (page %d)" % (base, pi + 1)
+                        self.items.append({"name": name, "path": path, "page": pi, "doc": doc,
+                                           "is_image": False, "copies": 1, "scale": 1.0})
+            except Exception as e:
+                messagebox.showerror("Cannot open file", "%s\n\n%s" % (path, e))
+        self.refresh_table()
+        self.rebuild()
+
+    def refresh_table(self):
+        if not hasattr(self, "tree"):
+            return
+        keep = [i for i in self.tree.selection()]
+        self.tree.delete(*self.tree.get_children())
+        for i, it in enumerate(self.items):
+            try:
+                w, h = composer.design_size_mm(it["doc"], it["page"])
+                size = "%s x %s %s" % (self.fmt(w * it["scale"]), self.fmt(h * it["scale"]), self.unit)
+            except Exception:
+                size = "?"
+            self.tree.insert("", "end", iid=str(i), values=(
+                it["name"], size, it["copies"], ("%g" % (it["scale"] * 100))))
+        keep = [i for i in keep if self.tree.exists(i)]
+        if keep:
+            self.tree.selection_set(keep)
+
+    def on_item_select(self):
+        sel = self.tree.selection()
+        if len(sel) == 1:
+            it = self.items[int(sel[0])]
+            self.v["item_copies"].set(str(it["copies"]))
+            self.v["item_scale"].set("%g" % (it["scale"] * 100))
+
+    def apply_items(self, everything):
+        try:
+            copies = max(int(float(self.v["item_copies"].get() or 1)), 0)
+            scale = float(self.v["item_scale"].get().replace(",", ".") or 100) / 100.0
+            if scale <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Check numbers", "Copies and Size % must be numbers (Size % above 0).")
+            return
+        ids = range(len(self.items)) if everything else [int(i) for i in self.tree.selection()]
+        for i in ids:
+            self.items[i]["copies"] = copies
+            self.items[i]["scale"] = scale
+        self.refresh_table()
+        self.rebuild()
+
+    def remove_items(self):
+        for i in sorted((int(x) for x in self.tree.selection()), reverse=True):
+            del self.items[i]
+        self.refresh_table()
+        self.rebuild()
+
+    def clear_items(self):
+        self.items = []
+        self.refresh_table()
+        self.rebuild()
+
+    def rebuild_mix(self):
+        self._after = None
+        if not self.items:
+            self.out = None
+            self.status.config(text="Click 'Add files...' to put designs on the sheet",
+                               foreground="#555")
+            self.file_lbl.config(text="No designs in the list")
+            self.draw_preview()
+            return
+        try:
+            for it in self.items:
+                if it["is_image"]:  # new DPI = new real size
+                    it["doc"] = composer.open_source(it["path"], self.image_dpi())
+            s = self.settings()
+            self.refresh_table()
+            out, info = composer.compose_mix(self.items, s)
+        except Exception as e:
+            self.out = None
+            self.status.config(text="Problem: %s" % e, foreground="#b00020")
+            self.draw_preview()
+            return
+        if self.out is not None:
+            self.out.close()
+        self.out, self.info = out, info
+        self.preview_index = min(self.preview_index, len(out) - 1)
+        self.file_lbl.config(text="%d design(s) in the list" % len(self.items))
+        txt = "%d sheet(s)  |  %d designs placed" % (info["sheets"], info["placed"])
+        if info["shrunk"]:
+            txt += "  |  some designs were too big and were shrunk to fit"
         self.status.config(text=txt, foreground="#555")
         self.draw_preview()
 
@@ -340,7 +508,9 @@ class App(tk.Tk):
         if self.out is None:
             messagebox.showinfo("Nothing to save", "Open a PDF and fix any problems first.")
             return
-        base = os.path.splitext(os.path.basename(self.src_path))[0] + "_sheet.pdf"
+        base = (os.path.splitext(os.path.basename(self.src_path))[0] or "mixed") + "_sheet.pdf"
+        if self.v["layout"].get() == "mix":
+            base = "mixed_sheet.pdf"
         path = filedialog.asksaveasfilename(defaultextension=".pdf", initialfile=base,
                                             filetypes=[("PDF", "*.pdf")])
         if path:
@@ -387,7 +557,7 @@ class App(tk.Tk):
             try:
                 import printing
                 printing.print_document(doc, printer, copies=n,
-                                        title=os.path.basename(self.src_path))
+                                        title=os.path.basename(self.src_path) or "Sheet Printer")
                 self.after(0, lambda: self.status.config(text="Sent to printer", foreground="#2e7d32"))
             except Exception as e:
                 self.after(0, lambda: messagebox.showerror("Print failed", str(e)))
