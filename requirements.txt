@@ -1,0 +1,4 @@
+pymupdf
+pillow
+pywin32
+pyinstaller
