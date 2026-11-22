@@ -37,7 +37,7 @@ class App(tk.Tk):
             ("paper_w", "210"), ("paper_h", "297"), ("margin", "10"),
             ("gap_x", "5"), ("gap_y", "5"), ("rotation", "0"),
             ("mode", "auto"), ("copies", "10"), ("columns", "0"),
-            ("center", "1"), ("crop", "1"), ("mark_len", "4"), ("mark_off", "1"),
+            ("center", "1"), ("crop", "1"), ("border", "0"), ("border_w", "0.3"), ("image_dpi", "300"), ("mark_len", "4"), ("mark_off", "1"),
             ("unit", "mm"), ("printer", ""), ("sheet_copies", "1"),
         ]:
             self.v[name] = tk.StringVar(value=default)
@@ -61,7 +61,7 @@ class App(tk.Tk):
         def label(text, row, col=0, **kw):
             ttk.Label(left, text=text).grid(row=row, column=col, sticky="w", pady=2, **kw)
 
-        ttk.Button(left, text="Open PDF...", command=self.open_pdf).grid(
+        ttk.Button(left, text="Open PDF or image...", command=self.open_pdf).grid(
             row=r, column=0, columnspan=2, sticky="we")
         self.file_lbl = ttk.Label(left, text="No file opened", wraplength=250, foreground="#555")
         self.file_lbl.grid(row=r + 1, column=0, columnspan=3, sticky="w", pady=(2, 8))
@@ -122,6 +122,12 @@ class App(tk.Tk):
         ttk.Entry(left, textvariable=self.v["columns"], width=10).grid(row=r, column=1, sticky="w"); r += 1
         ttk.Checkbutton(left, text="Centre on paper", variable=self.v["center"],
                         onvalue="1", offvalue="0").grid(row=r, column=0, columnspan=3, sticky="w"); r += 1
+        ttk.Checkbutton(left, text="Border around each design", variable=self.v["border"],
+                        onvalue="1", offvalue="0").grid(row=r, column=0, columnspan=3, sticky="w"); r += 1
+        label("   Border thickness", r)
+        ttk.Entry(left, textvariable=self.v["border_w"], width=10).grid(row=r, column=1, sticky="w"); r += 1
+        label("Image DPI (images only)", r)
+        ttk.Entry(left, textvariable=self.v["image_dpi"], width=10).grid(row=r, column=1, sticky="w"); r += 1
         ttk.Checkbutton(left, text="Crop marks (drawn in the margin)", variable=self.v["crop"],
                         onvalue="1", offvalue="0").grid(row=r, column=0, columnspan=3, sticky="w"); r += 1
         label("   Mark length", r)
@@ -177,7 +183,7 @@ class App(tk.Tk):
         if new == old:
             return
         self._muting = True
-        for name in ("paper_w", "paper_h", "margin", "gap_x", "gap_y", "mark_len", "mark_off"):
+        for name in ("paper_w", "paper_h", "margin", "gap_x", "gap_y", "mark_len", "mark_off", "border_w"):
             try:
                 val_mm = float(self.v[name].get().replace(",", ".")) * UNITS[old]
             except ValueError:
@@ -231,6 +237,7 @@ class App(tk.Tk):
             "center": self.v["center"].get() == "1",
             "crop_marks": self.v["crop"].get() == "1",
             "mark_len": self.mm("mark_len"), "mark_off": self.mm("mark_off"),
+            "border": self.v["border"].get() == "1", "border_w": self.mm("border_w"),
             "grid": None,
         }
         cols = int(float(self.v["columns"].get() or 0))
@@ -244,11 +251,14 @@ class App(tk.Tk):
 
     # ---------- actions ----------
     def open_pdf(self):
-        path = filedialog.askopenfilename(title="Open PDF", filetypes=[("PDF files", "*.pdf")])
+        path = filedialog.askopenfilename(
+            title="Open PDF or image",
+            filetypes=[("PDF or image", "*.pdf *.png *.jpg *.jpeg *.bmp *.tif *.tiff *.gif *.webp"),
+                       ("PDF files", "*.pdf"), ("Images", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.gif *.webp")])
         if not path:
             return
         try:
-            doc = composer.open_source(path)
+            doc = composer.open_source(path, self.image_dpi())
             if len(doc) == 0:
                 raise ValueError("This PDF has no pages")
         except Exception as e:
@@ -260,6 +270,12 @@ class App(tk.Tk):
             os.path.basename(path), len(doc), self.fmt(w), self.fmt(h), self.unit))
         self.preview_index = 0
         self.rebuild()
+
+    def image_dpi(self):
+        try:
+            return max(float(self.v["image_dpi"].get().replace(",", ".")), 1.0)
+        except ValueError:
+            return 300.0
 
     def schedule(self):
         if self._muting:
@@ -273,6 +289,8 @@ class App(tk.Tk):
         if self.src is None:
             return
         try:
+            if composer.is_image(self.src_path):  # new DPI = new real size
+                self.src = composer.open_source(self.src_path, self.image_dpi())
             s = self.settings()
             out, info = composer.compose(self.src, s)
         except Exception as e:
