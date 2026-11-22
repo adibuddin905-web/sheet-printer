@@ -66,6 +66,16 @@ def _draw_marks(page, plan, rows_used, cols_used, s):
     shape.commit()
 
 
+def _fit_scale(s, dw, dh, rot):
+    """Scale factor that makes the design just fit inside the margins."""
+    cw, ch = g.effective_cell(dw, dh, rot)
+    uw = s["paper_w"] - 2 * s["margin"]
+    uh = s["paper_h"] - 2 * s["margin"]
+    if uw <= 0 or uh <= 0 or cw <= 0 or ch <= 0:
+        return 0.0
+    return min(uw / cw, uh / ch)
+
+
 def compose(src, s):
     """src: open fitz document. s: settings dict (mm). Returns (doc, info)."""
     pages = g.parse_pages(s["pages"], len(src))
@@ -81,6 +91,17 @@ def compose(src, s):
         plan = g.plan_sheet(s["paper_w"], s["paper_h"], s["margin"], dw, dh,
                             rot, s["gap_x"], s["gap_y"],
                             cols_rows=s.get("grid"), center=s["center"])
+        if plan["per_sheet"] == 0:
+            # Design is bigger than the paper: shrink it (same proportions,
+            # PDF stays sharp) so exactly one copy fits.
+            if s["rotation"] == "auto":
+                rot = max((0, 90), key=lambda r: _fit_scale(s, dw, dh, r))
+            sc = min(_fit_scale(s, dw, dh, rot), 1.0) * 0.9995
+            if sc > 0.001:
+                dw, dh = dw * sc, dh * sc
+                plan = g.plan_sheet(s["paper_w"], s["paper_h"], s["margin"], dw, dh,
+                                    rot, s["gap_x"], s["gap_y"],
+                                    cols_rows=s.get("grid"), center=s["center"])
         if plan["per_sheet"] == 0:
             raise ValueError(
                 "Design (%.1f x %.1f mm) does not fit on the paper with these "
