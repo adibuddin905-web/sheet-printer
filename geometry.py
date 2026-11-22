@@ -110,3 +110,87 @@ def parse_pages(text, total):
     if not pages:
         raise ValueError("No pages selected")
     return pages
+
+
+# ---------------------------------------------------------------------------
+# Mixed layout: many different designs on the same sheet
+# ---------------------------------------------------------------------------
+def _orient(w, h, rot):
+    return (h, w) if rot in (90, 270) else (w, h)
+
+
+def _shelf_pack(sizes, uw, uh, gap_x, gap_y):
+    """sizes: list of (idx, w, h, rot). Rows ("shelves") packed top to bottom."""
+    order = sorted(sizes, key=lambda t: -t[2])  # tallest first
+    sheets = []
+    for (idx, w, h, rot) in order:
+        placed = False
+        for sh in sheets:
+            for shelf in sh["shelves"]:
+                if h <= shelf["h"] + EPS and shelf["x"] + gap_x + w <= uw + EPS:
+                    x = shelf["x"] + gap_x
+                    shelf["items"].append((idx, x, w, h, rot))
+                    shelf["x"] = x + w
+                    placed = True
+                    break
+            if placed:
+                break
+            y = sh["used"] + gap_y
+            if y + h <= uh + EPS:
+                sh["shelves"].append({"y": y, "h": h, "x": w,
+                                      "items": [(idx, 0.0, w, h, rot)]})
+                sh["used"] = y + h
+                placed = True
+                break
+        if not placed:
+            sheets.append({"used": h, "shelves": [
+                {"y": 0.0, "h": h, "x": w, "items": [(idx, 0.0, w, h, rot)]}]})
+    return sheets
+
+
+def pack_mixed(items, paper_w, paper_h, margin, gap_x, gap_y,
+               rotation="auto", center=True):
+    """items: list of (w, h) in mm, each already small enough to fit.
+
+    Returns (placements, n_sheets); placement = dict(idx, sheet, x, y, w, h, rot)
+    where (x, y) is the top-left corner on the paper.
+    """
+    uw = paper_w - 2 * margin
+    uh = paper_h - 2 * margin
+    n = len(items)
+    if rotation == "auto":
+        variants = [[0] * n, [90] * n,
+                    [0 if w >= h else 90 for (w, h) in items],
+                    [0 if h >= w else 90 for (w, h) in items],
+                    [0 if (w <= uw + EPS and h <= uh + EPS) else 90
+                     for (w, h) in items]]
+    else:
+        variants = [[int(rotation)] * n]
+    best = None
+    for rv in variants:
+        sizes = []
+        ok = True
+        for i, (w, h) in enumerate(items):
+            ow, oh = _orient(w, h, rv[i])
+            if ow > uw + EPS or oh > uh + EPS:
+                ok = False
+                break
+            sizes.append((i, ow, oh, rv[i]))
+        if not ok:
+            continue
+        sheets = _shelf_pack(sizes, uw, uh, gap_x, gap_y)
+        score = (len(sheets), sum(sh["used"] for sh in sheets))
+        if best is None or score < best[0]:
+            best = (score, sheets)
+    if best is None:
+        raise ValueError("A design does not fit on the paper with these margins.")
+    placements = []
+    for si, sh in enumerate(best[1]):
+        content_w = max(shelf["x"] for shelf in sh["shelves"])
+        ox = margin + ((uw - content_w) / 2.0 if center else 0.0)
+        oy = margin + ((uh - sh["used"]) / 2.0 if center else 0.0)
+        for shelf in sh["shelves"]:
+            for (idx, x, w, h, rot) in shelf["items"]:
+                placements.append({"idx": idx, "sheet": si, "x": ox + x,
+                                   "y": oy + shelf["y"], "w": w, "h": h, "rot": rot})
+    return placements, len(best[1])
