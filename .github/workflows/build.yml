@@ -1,0 +1,46 @@
+name: Build SheetPrinter.exe
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Put the release number inside the app
+        if: github.event_name == 'release'
+        shell: bash
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          echo "__version__ = \"${TAG#v}\"" > version.py
+
+      - name: Build exe
+        run: pyinstaller --onefile --windowed --name SheetPrinter --hidden-import win32timezone app.py
+
+      - name: Attach exe to the release
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/SheetPrinter.exe --clobber
+
+      - name: Keep exe as a download (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SheetPrinter
+          path: dist/SheetPrinter.exe
