@@ -247,10 +247,23 @@ def design_size_mm(doc, page_index):
     return r.width / MM, r.height / MM
 
 
+_REUSE_OK = [True]
+
+
 def _show(page, rect, doc, pno, rot, cache):
-    """Place a page; the same source page is stored only once (fast, small file)."""
+    """Place a page. Newer PyMuPDF versions store the same source page once by
+    themselves; older ones accept reuse_xref (used here when available)."""
     key = (id(doc), pno)
-    xr = page.show_pdf_page(rect, doc, pno, rotate=int(rot), reuse_xref=cache.get(key, 0))
+    xr = 0
+    if _REUSE_OK[0]:
+        try:
+            xr = page.show_pdf_page(rect, doc, pno, rotate=int(rot),
+                                    reuse_xref=cache.get(key, 0))
+        except TypeError:  # this PyMuPDF has no reuse_xref option
+            _REUSE_OK[0] = False
+            xr = page.show_pdf_page(rect, doc, pno, rotate=int(rot))
+    else:
+        xr = page.show_pdf_page(rect, doc, pno, rotate=int(rot))
     if isinstance(xr, int) and xr > 0:
         cache[key] = xr
 
