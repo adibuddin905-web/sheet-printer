@@ -84,6 +84,8 @@ def compose(src, s):
     per_sheet_info = []
     for pi in pages:
         dw, dh = design_size_mm(src, pi)
+        k = s.get("scale", 1.0)  # manual size change (1.0 = original size)
+        dw, dh = dw * k, dh * k
         rot = s["rotation"]
         if rot == "auto":
             rot = g.best_rotation(s["paper_w"], s["paper_h"], s["margin"],
@@ -128,8 +130,56 @@ def compose(src, s):
                 cols_used, rows_used = n, 1
             _draw_marks(sheet, plan, rows_used, cols_used, s)
             total_sheets += 1
-        per_sheet_info.append((pi + 1, plan["per_sheet"], copies, rot))
+        per_sheet_info.append((pi + 1, plan["per_sheet"], copies, rot, dw, dh))
     return out, {"sheets": total_sheets, "details": per_sheet_info}
+
+
+def compose_mix(items, s):
+    """Many different designs on the same sheet(s).
+
+    items: list of dicts {"doc", "page", "copies", "scale"}  (scale 1.0 = original)
+    """
+    uw = s["paper_w"] - 2 * s["margin"]
+    uh = s["paper_h"] - 2 * s["margin"]
+    if uw <= 0 or uh <= 0:
+        raise ValueError("Margins are bigger than the paper")
+    rotation = s["rotation"]
+    sizes, owner = [], []
+    shrunk = False
+    for i, it in enumerate(items):
+        dw, dh = design_size_mm(it["doc"], it["page"])
+        dw, dh = dw * it["scale"], dh * it["scale"]
+        if rotation == "auto":
+            fit = max(min(uw / dw, uh / dh), min(uw / dh, uh / dw))
+        else:
+            ow, oh = g._orient(dw, dh, int(rotation))
+            fit = min(uw / ow, uh / oh)
+        if fit < 1.0:
+            dw, dh = dw * fit * 0.9995, dh * fit * 0.9995
+            shrunk = True
+        for _ in range(max(int(it["copies"]), 0)):
+            sizes.append((dw, dh))
+            owner.append(i)
+    if not sizes:
+        raise ValueError("Set at least 1 copy for a design")
+    placements, n_sheets = g.pack_mixed(sizes, s["paper_w"], s["paper_h"],
+                                        s["margin"], s["gap_x"], s["gap_y"],
+                                        rotation, s["center"])
+    out = fitz.open()
+    pages = [out.new_page(width=pt(s["paper_w"]), height=pt(s["paper_h"]))
+             for _ in range(n_sheets)]
+    borders = [p.new_shape() if s.get("border") else None for p in pages]
+    for pl in placements:
+        it = items[owner[pl["idx"]]]
+        rect = fitz.Rect(pt(pl["x"]), pt(pl["y"]), pt(pl["x"] + pl["w"]), pt(pl["y"] + pl["h"]))
+        pages[pl["sheet"]].show_pdf_page(rect, it["doc"], it["page"], rotate=int(pl["rot"]))
+        if borders[pl["sheet"]] is not None:
+            borders[pl["sheet"]].draw_rect(rect)
+    for b in borders:
+        if b is not None:
+            b.finish(color=(0, 0, 0), width=max(pt(s.get("border_w", 0.3)), 0.1))
+            b.commit()
+    return out, {"sheets": n_sheets, "placed": len(placements), "shrunk": shrunk}
 
 
 def render_page(doc, index, dpi):
