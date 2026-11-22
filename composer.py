@@ -166,19 +166,24 @@ def compose_mix(items, s):
                                         s["margin"], s["gap_x"], s["gap_y"],
                                         rotation, s["center"])
     out = fitz.open()
-    pages = [out.new_page(width=pt(s["paper_w"]), height=pt(s["paper_h"]))
-             for _ in range(n_sheets)]
-    borders = [p.new_shape() if s.get("border") else None for p in pages]
-    for pl in placements:
-        it = items[owner[pl["idx"]]]
-        rect = fitz.Rect(pt(pl["x"]), pt(pl["y"]), pt(pl["x"] + pl["w"]), pt(pl["y"] + pl["h"]))
-        pages[pl["sheet"]].show_pdf_page(rect, it["doc"], it["page"], rotate=int(pl["rot"]))
-        if borders[pl["sheet"]] is not None:
-            borders[pl["sheet"]].draw_rect(rect)
-    for b in borders:
-        if b is not None:
-            b.finish(color=(0, 0, 0), width=max(pt(s.get("border_w", 0.3)), 0.1))
-            b.commit()
+    for _ in range(n_sheets):
+        out.new_page(width=pt(s["paper_w"]), height=pt(s["paper_h"]))
+    # NOTE: PyMuPDF invalidates old page objects when pages are added, so all
+    # pages are created first and each one is fetched fresh when drawing.
+    for si in range(n_sheets):
+        page = out[si]
+        border = page.new_shape() if s.get("border") else None
+        for pl in placements:
+            if pl["sheet"] != si:
+                continue
+            it = items[owner[pl["idx"]]]
+            rect = fitz.Rect(pt(pl["x"]), pt(pl["y"]), pt(pl["x"] + pl["w"]), pt(pl["y"] + pl["h"]))
+            page.show_pdf_page(rect, it["doc"], it["page"], rotate=int(pl["rot"]))
+            if border is not None:
+                border.draw_rect(rect)
+        if border is not None:
+            border.finish(color=(0, 0, 0), width=max(pt(s.get("border_w", 0.3)), 0.1))
+            border.commit()
     return out, {"sheets": n_sheets, "placed": len(placements), "shrunk": shrunk}
 
 
