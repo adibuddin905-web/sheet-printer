@@ -13,8 +13,24 @@ def pt(mm):
     return mm * MM
 
 
-def open_source(path):
-    return fitz.open(path)
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".gif", ".webp")
+
+
+def is_image(path):
+    return path.lower().endswith(IMAGE_EXT)
+
+
+def open_source(path, dpi=300):
+    """Opens a PDF, or turns an image into a one-page PDF at the given DPI."""
+    if not is_image(path):
+        return fitz.open(path)
+    pix = fitz.Pixmap(path)
+    w = pix.width / float(dpi) * 72.0
+    h = pix.height / float(dpi) * 72.0
+    doc = fitz.open()
+    page = doc.new_page(width=w, height=h)
+    page.insert_image(page.rect, filename=path)
+    return doc
 
 
 def design_size_mm(doc, page_index):
@@ -76,9 +92,15 @@ def compose(src, s):
             left -= n
             sheet = out.new_page(width=pt(s["paper_w"]), height=pt(s["paper_h"]))
             pos = g.cell_positions(plan, n)
+            border = sheet.new_shape() if s.get("border") else None
             for (x, y) in pos:
                 rect = fitz.Rect(pt(x), pt(y), pt(x + plan["cell_w"]), pt(y + plan["cell_h"]))
                 sheet.show_pdf_page(rect, src, pi, rotate=int(rot))
+                if border is not None:
+                    border.draw_rect(rect)
+            if border is not None:
+                border.finish(color=(0, 0, 0), width=max(pt(s.get("border_w", 0.3)), 0.1))
+                border.commit()
             if n >= plan["cols"]:
                 cols_used, rows_used = plan["cols"], -(-n // plan["cols"])
             else:
