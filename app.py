@@ -2,6 +2,7 @@
 
 Everything lives in this ONE file (plus version.py, which GitHub fills in).
 """
+import io
 import json
 import math
 import os
@@ -19,7 +20,7 @@ try:
     import pymupdf as fitz
 except ImportError:  # older PyMuPDF
     import fitz
-from PIL import Image
+from PIL import Image, ImageDraw, ImageOps
 
 from version import __version__
 
@@ -36,6 +37,9 @@ PAPER_SIZES = {
     "Tabloid": (279.4, 431.8), "Custom": None,
 }
 IMAGE_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".gif", ".webp")
+ARRANGE_MODES = {"Best fit (saves paper)": "best",
+                 "In order: across rows": "rows",
+                 "In order: down columns": "cols"}
 FITZ_LOCK = threading.RLock()  # PyMuPDF is used from several threads: one at a time
 
 
@@ -160,44 +164,107 @@ def _shelf_pack(sizes, uw, uh, gap_x, gap_y):
     return sheets
 
 
-def pack_mixed(items, paper_w, paper_h, margin, gap_x, gap_y, rotation="auto", center=True):
+def _flatten_shelves(sheets):
+    flat = []
+    for sh in sheets:
+        items = []
+        for shelf in sh["shelves"]:
+            for (idx, x, w, h, rot) in shelf["items"]:
+                items.append((idx, x, shelf["y"], w, h, rot))
+        flat.append({"cw": max(shelf["x"] for shelf in sh["shelves"]),
+                     "ch": sh["used"], "items": items})
+    return flat
+
+
+def _ordered_pack(sizes, uw, uh, gap_x, gap_y, by_rows):
+    """Keeps the order of the list. sizes: [(idx, w, h, rot)].
+    by_rows=True: 1 2 3 / 4 5 6.   by_rows=False: 1 4 / 2 5 / 3 6 (down columns)."""
+    if not by_rows:
+        tr = [(i, h, w, r) for (i, w, h, r) in sizes]
+        flat = _ordered_pack(tr, uh, uw, gap_y, gap_x, True)
+        return [{"cw": sh["ch"], "ch": sh["cw"],
+                 "items": [(i, y, x, h, w, r) for (i, x, y, w, h, r) in sh["items"]]}
+                for sh in flat]
+    sheets, cur = [], None
+    for (idx, w, h, rot) in sizes:
+        line = cur["lines"][-1] if cur else None
+        if line is not None:
+            nx = line["x"] + gap_x + w
+            nth = max(line["th"], h)
+            if nx <= uw + EPS and line["y"] + nth <= uh + EPS:
+                line["items"].append((idx, line["x"] + gap_x, w, h, rot))
+                line["x"], line["th"] = nx, nth
+                continue
+            y = line["y"] + line["th"] + gap_y
+            if y + h <= uh + EPS:
+                cur["lines"].append({"y": y, "th": h, "x": w,
+                                     "items": [(idx, 0.0, w, h, rot)]})
+                continue
+        cur = {"lines": [{"y": 0.0, "th": h, "x": w, "items": [(idx, 0.0, w, h, rot)]}]}
+        sheets.append(cur)
+    flat = []
+    for sh in sheets:
+        items = []
+        for ln in sh["lines"]:
+            for (idx, x, w, h, rot) in ln["items"]:
+                items.append((idx, x, ln["y"], w, h, rot))
+        last = sh["lines"][-1]
+        flat.append({"cw": max(ln["x"] for ln in sh["lines"]),
+                     "ch": last["y"] + last["th"], "items": items})
+    return flat
+
+
+def pack_mixed(items, paper_w, paper_h, margin, gap_x, gap_y, rotation="auto",
+               center=True, arrange="best"):
     uw = paper_w - 2 * margin
     uh = paper_h - 2 * margin
     n = len(items)
-    if rotation == "auto":
-        variants = [[0] * n, [90] * n,
-                    [0 if w >= h else 90 for (w, h) in items],
-                    [0 if h >= w else 90 for (w, h) in items],
-                    [0 if (w <= uw + EPS and h <= uh + EPS) else 90 for (w, h) in items]]
-    else:
-        variants = [[int(rotation)] * n]
     best = None
-    for rv in variants:
-        sizes, ok = [], True
+    if arrange in ("rows", "cols"):
+        sizes = []
         for i, (w, h) in enumerate(items):
-            ow, oh = _orient(w, h, rv[i])
+            if rotation == "auto":
+                rot = 0 if (w <= uw + EPS and h <= uh + EPS) else 90
+            else:
+                rot = int(rotation)
+            ow, oh = _orient(w, h, rot)
             if ow > uw + EPS or oh > uh + EPS:
-                ok = False
-                break
-            sizes.append((i, ow, oh, rv[i]))
-        if not ok:
-            continue
-        sheets = _shelf_pack(sizes, uw, uh, gap_x, gap_y)
-        score = (len(sheets), sum(sh["used"] for sh in sheets))
-        if best is None or score < best[0]:
-            best = (score, sheets)
-    if best is None:
-        raise ValueError("A design does not fit on the paper with these margins.")
+                raise ValueError("A design does not fit on the paper with these margins.")
+            sizes.append((i, ow, oh, rot))
+        best = _ordered_pack(sizes, uw, uh, gap_x, gap_y, arrange == "rows")
+    else:
+        if rotation == "auto":
+            variants = [[0] * n, [90] * n,
+                        [0 if w >= h else 90 for (w, h) in items],
+                        [0 if h >= w else 90 for (w, h) in items],
+                        [0 if (w <= uw + EPS and h <= uh + EPS) else 90 for (w, h) in items]]
+        else:
+            variants = [[int(rotation)] * n]
+        best_score = None
+        for rv in variants:
+            sizes, ok = [], True
+            for i, (w, h) in enumerate(items):
+                ow, oh = _orient(w, h, rv[i])
+                if ow > uw + EPS or oh > uh + EPS:
+                    ok = False
+                    break
+                sizes.append((i, ow, oh, rv[i]))
+            if not ok:
+                continue
+            flat = _flatten_shelves(_shelf_pack(sizes, uw, uh, gap_x, gap_y))
+            score = (len(flat), sum(sh["ch"] for sh in flat))
+            if best_score is None or score < best_score:
+                best_score, best = score, flat
+        if best is None:
+            raise ValueError("A design does not fit on the paper with these margins.")
     placements = []
-    for si, sh in enumerate(best[1]):
-        content_w = max(shelf["x"] for shelf in sh["shelves"])
-        ox = margin + ((uw - content_w) / 2.0 if center else 0.0)
-        oy = margin + ((uh - sh["used"]) / 2.0 if center else 0.0)
-        for shelf in sh["shelves"]:
-            for (idx, x, w, h, rot) in shelf["items"]:
-                placements.append({"idx": idx, "sheet": si, "x": ox + x,
-                                   "y": oy + shelf["y"], "w": w, "h": h, "rot": rot})
-    return placements, len(best[1])
+    for si, sh in enumerate(best):
+        ox = margin + ((uw - sh["cw"]) / 2.0 if center else 0.0)
+        oy = margin + ((uh - sh["ch"]) / 2.0 if center else 0.0)
+        for (idx, x, y, w, h, rot) in sh["items"]:
+            placements.append({"idx": idx, "sheet": si, "x": ox + x, "y": oy + y,
+                               "w": w, "h": h, "rot": rot})
+    return placements, len(best)
 
 
 # ===========================================================================
@@ -240,6 +307,47 @@ def get_doc(path, dpi):
         _DOC_CACHE.clear()
     _DOC_CACHE[key] = doc
     return doc
+
+
+_INV_CACHE = {}
+
+
+def inverted_doc(doc, pno, full, regions, dpi):
+    """One-page PDF holding the page as a picture with colours inverted.
+    full: invert everything.  regions: list of polygons (points 0..1 of the page);
+    inside a polygon the colours are flipped again (so full + area = area stays normal)."""
+    regions = tuple(tuple((float(x), float(y)) for (x, y) in r) for r in (regions or ()))
+    key = (id(doc), pno, bool(full), regions, int(round(dpi)))
+    hit = _INV_CACHE.get(key)
+    if hit is not None:
+        return hit[1]
+    page = doc[pno]
+    rect = page.rect
+    zoom = max(dpi, 72.0) / 72.0
+    zoom = min(zoom, 8000.0 / max(rect.width, rect.height))
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    inv = ImageOps.invert(img)
+    if regions:
+        mask = Image.new("L", img.size, 0)
+        draw = ImageDraw.Draw(mask)
+        for poly in regions:
+            if len(poly) >= 3:
+                draw.polygon([(x * (img.width - 1), y * (img.height - 1)) for (x, y) in poly],
+                             fill=255)
+        base, other = (inv, img) if full else (img, inv)
+        result = Image.composite(other, base, mask)
+    else:
+        result = inv if full else img
+    buf = io.BytesIO()
+    result.save(buf, "PNG", compress_level=1)
+    new = fitz.open()
+    p = new.new_page(width=rect.width, height=rect.height)
+    p.insert_image(p.rect, stream=buf.getvalue())
+    if len(_INV_CACHE) > 12:
+        _INV_CACHE.clear()
+    _INV_CACHE[key] = (doc, new)  # keeps the source alive so id(doc) stays valid
+    return new
 
 
 def design_size_mm(doc, page_index):
@@ -307,12 +415,21 @@ def compose(src, s):
     pages = parse_pages(s["pages"], len(src))
     out = fitz.open()
     cache = {}
+    keep = []
     total_sheets = 0
     details = []
     for pi in pages:
         dw, dh = design_size_mm(src, pi)
         k = s.get("scale", 1.0)
         dw, dh = dw * k, dh * k
+        src_pg, src_no = src, pi
+        inv = s.get("invert") or {}
+        if inv.get("full") or inv.get("regions"):
+            d = max(s.get("invert_dpi", 300) * k,
+                    s.get("image_dpi", 300) if s.get("src_is_image") else 0, 72)
+            src_pg = inverted_doc(src, pi, inv.get("full"), inv.get("regions") or (), d)
+            keep.append(src_pg)
+            src_no = 0
         rot = s["rotation"]
         if rot == "auto":
             rot = best_rotation(s["paper_w"], s["paper_h"], s["margin"], dw, dh,
@@ -340,7 +457,7 @@ def compose(src, s):
             border = sheet.new_shape() if s.get("border") else None
             for (x, y) in cell_positions(plan, n):
                 rect = fitz.Rect(pt(x), pt(y), pt(x + plan["cell_w"]), pt(y + plan["cell_h"]))
-                _show(sheet, rect, src, pi, rot, cache)
+                _show(sheet, rect, src_pg, src_no, rot, cache)
                 if border is not None:
                     border.draw_rect(rect)
             if border is not None:
@@ -382,11 +499,13 @@ def compose_mix(items, s):
     if not sizes:
         raise ValueError("Set at least 1 copy for a design")
     placements, n_sheets = pack_mixed(sizes, s["paper_w"], s["paper_h"], s["margin"],
-                                      s["gap_x"], s["gap_y"], rotation, s["center"])
+                                      s["gap_x"], s["gap_y"], rotation, s["center"],
+                                      s.get("arrange", "best"))
     out = fitz.open()
     for _ in range(n_sheets):
         out.new_page(width=pt(s["paper_w"]), height=pt(s["paper_h"]))
     cache = {}
+    keep = []
     for si in range(n_sheets):  # PyMuPDF: fetch each page fresh after all are created
         page = out[si]
         border = page.new_shape() if s.get("border") else None
@@ -395,7 +514,15 @@ def compose_mix(items, s):
                 continue
             it = items[owner[pl["idx"]]]
             rect = fitz.Rect(pt(pl["x"]), pt(pl["y"]), pt(pl["x"] + pl["w"]), pt(pl["y"] + pl["h"]))
-            _show(page, rect, it["doc"], it["page"], pl["rot"], cache)
+            d_doc, d_no = it["doc"], it["page"]
+            if it.get("inv_full") or it.get("regions"):
+                d = max(s.get("invert_dpi", 300) * it["scale"],
+                        s.get("image_dpi", 300) if is_image(it["path"]) else 0, 72)
+                d_doc = inverted_doc(it["doc"], it["page"], it.get("inv_full"),
+                                     it.get("regions") or (), d)
+                keep.append(d_doc)
+                d_no = 0
+            _show(page, rect, d_doc, d_no, pl["rot"], cache)
             if border is not None:
                 border.draw_rect(rect)
         if border is not None:
@@ -527,6 +654,106 @@ def clean_number(text):
     return ("%.4f" % v).rstrip("0").rstrip(".")
 
 
+class AreaSelector(tk.Toplevel):
+    """Window to draw (freehand or rectangle) the areas whose colours get inverted."""
+
+    def __init__(self, master, img, regions, base_inverted, on_done):
+        super().__init__(master)
+        self.title("Select area to invert")
+        self.transient(master)
+        self.on_done = on_done
+        scale = min(900.0 / img.width, 640.0 / img.height)
+        self.w, self.h = max(int(img.width * scale), 50), max(int(img.height * scale), 50)
+        shown = img.resize((self.w, self.h), Image.LANCZOS)
+        flipped = ImageOps.invert(shown)
+        self.base, self.other = (flipped, shown) if base_inverted else (shown, flipped)
+        self.regions = [[(x * self.w, y * self.h) for (x, y) in r] for r in regions]
+        self.cur = None
+        self.start = None
+        self.tool = tk.StringVar(value="free")
+        bar = ttk.Frame(self, padding=6)
+        bar.pack(fill="x")
+        ttk.Radiobutton(bar, text="Freehand (lasso)", variable=self.tool, value="free").pack(side="left")
+        ttk.Radiobutton(bar, text="Rectangle", variable=self.tool, value="rect").pack(side="left", padx=8)
+        ttk.Button(bar, text="Undo last", command=self.undo).pack(side="left", padx=4)
+        ttk.Button(bar, text="Clear all", command=self.clear).pack(side="left")
+        ttk.Button(bar, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(bar, text="Done", command=self.finish).pack(side="right", padx=6)
+        ttk.Label(self, text="Hold the left mouse button and draw. Selected areas are shown inverted.",
+                  foreground="#555").pack(anchor="w", padx=8)
+        self.canvas = tk.Canvas(self, width=self.w, height=self.h, highlightthickness=0, cursor="crosshair")
+        self.canvas.pack(padx=8, pady=8)
+        self.canvas.bind("<ButtonPress-1>", self.press)
+        self.canvas.bind("<B1-Motion>", self.drag)
+        self.canvas.bind("<ButtonRelease-1>", self.release)
+        self.redraw()
+        self.grab_set()
+
+    def redraw(self):
+        from PIL import ImageTk
+        mask = Image.new("L", (self.w, self.h), 0)
+        d = ImageDraw.Draw(mask)
+        for poly in self.regions:
+            if len(poly) >= 3:
+                d.polygon(poly, fill=255)
+        self._photo = ImageTk.PhotoImage(Image.composite(self.other, self.base, mask))
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
+        for poly in self.regions:
+            if len(poly) >= 3:
+                self.canvas.create_polygon(poly, outline="#e00000", fill="", width=2)
+
+    def _clip(self, e):
+        return (min(max(e.x, 0), self.w), min(max(e.y, 0), self.h))
+
+    def press(self, e):
+        self.start = self._clip(e)
+        self.cur = [self.start]
+
+    def drag(self, e):
+        if self.cur is None:
+            return
+        p = self._clip(e)
+        self.canvas.delete("tmp")
+        if self.tool.get() == "rect":
+            self.canvas.create_rectangle(self.start[0], self.start[1], p[0], p[1],
+                                         outline="#e00000", width=2, tags="tmp")
+        else:
+            self.cur.append(p)
+            if len(self.cur) > 1:
+                self.canvas.create_line(self.cur, fill="#e00000", width=2, tags="tmp")
+
+    def release(self, e):
+        if self.cur is None:
+            return
+        p = self._clip(e)
+        if self.tool.get() == "rect":
+            x0, y0 = self.start
+            poly = [(x0, y0), (p[0], y0), (p[0], p[1]), (x0, p[1])]
+            ok = abs(p[0] - x0) > 2 and abs(p[1] - y0) > 2
+        else:
+            poly = self.cur + [p]
+            ok = len(poly) >= 3
+        self.cur = None
+        if ok:
+            self.regions.append(poly)
+        self.redraw()
+
+    def undo(self):
+        if self.regions:
+            self.regions.pop()
+            self.redraw()
+
+    def clear(self):
+        self.regions = []
+        self.redraw()
+
+    def finish(self):
+        out = [[(x / self.w, y / self.h) for (x, y) in r] for r in self.regions if len(r) >= 3]
+        self.destroy()
+        self.on_done(out)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -552,6 +779,7 @@ class App(tk.Tk):
         self._muting = False
         self.unit = "mm"
         self.items = []
+        self.single_regions = []
         self._next_id = 1
         self.mm_spins = []
 
@@ -565,6 +793,7 @@ class App(tk.Tk):
             ("image_dpi", "300"), ("scale", "100"), ("mark_len", "4"), ("mark_off", "1"),
             ("unit", "mm"), ("printer", ""), ("sheet_copies", "1"),
             ("layout", "single"), ("item_copies", "1"), ("item_scale", "100"),
+            ("arrange", "Best fit (saves paper)"), ("inv_single", "0"), ("invert_dpi", "300"),
         ]:
             self.v[name] = tk.StringVar(value=default)
         for name, var in self.v.items():
@@ -671,6 +900,18 @@ class App(tk.Tk):
         num(r, "   Border thickness", "border_w", 0.1, "mm"); r += 1
         num(r, "Image DPI (images only)", "image_dpi", 10, "int", 1, 2400); r += 1
         num(r, "Design size % (100 = original)", "scale", 5, "int", 1, 5000); r += 1
+        label("Order (list mode)", r)
+        ttk.Combobox(left, textvariable=self.v["arrange"], values=list(ARRANGE_MODES),
+                     width=22, state="readonly").grid(row=r, column=1, columnspan=2, sticky="w"); r += 1
+        ttk.Checkbutton(left, text="Invert colours (one design)", variable=self.v["inv_single"],
+                        onvalue="1", offvalue="0").grid(row=r, column=0, columnspan=3, sticky="w"); r += 1
+        af = ttk.Frame(left)
+        af.grid(row=r, column=0, columnspan=3, sticky="w")
+        ttk.Button(af, text="Select area to invert...", command=self.pick_single_area).pack(side="left")
+        ttk.Button(af, text="Clear", width=6, command=self.clear_single_area).pack(side="left", padx=4)
+        self.area_lbl = ttk.Label(af, text="Areas: 0", foreground="#555")
+        self.area_lbl.pack(side="left", padx=4); r += 1
+        num(r, "   Invert quality (DPI)", "invert_dpi", 50, "int", 72, 1200); r += 1
         ttk.Checkbutton(left, text="Crop marks (drawn in the margin)", variable=self.v["crop"],
                         onvalue="1", offvalue="0").grid(row=r, column=0, columnspan=3, sticky="w"); r += 1
         num(r, "   Mark length", "mark_len", 1, "mm"); r += 1
@@ -705,10 +946,11 @@ class App(tk.Tk):
 
     def _build_mix_panel(self, parent):
         self.mix_frame = ttk.LabelFrame(parent, text="Designs on the sheet", padding=6)
-        self.tree = ttk.Treeview(self.mix_frame, columns=("name", "size", "copies", "scale"),
+        self.tree = ttk.Treeview(self.mix_frame, columns=("name", "size", "copies", "scale", "inv"),
                                  show="headings", height=5, selectmode="extended")
         for col, text, w in (("name", "Design", 300), ("size", "Size", 130),
-                             ("copies", "Copies", 70), ("scale", "Size %", 70)):
+                             ("copies", "Copies", 70), ("scale", "Size %", 70),
+                             ("inv", "Invert", 80)):
             self.tree.heading(col, text=text)
             self.tree.column(col, width=w, anchor="w")
         sb = ttk.Scrollbar(self.mix_frame, orient="vertical", command=self.tree.yview)
@@ -725,6 +967,13 @@ class App(tk.Tk):
         self.spin(self.mix_frame, "item_scale", 5, "int", 1, 5000, width=6).grid(row=1, column=6)
         ttk.Button(self.mix_frame, text="Apply to selected", command=lambda: self.apply_items(False)).grid(row=2, column=3, columnspan=3, pady=2, sticky="we")
         ttk.Button(self.mix_frame, text="Apply to all", command=lambda: self.apply_items(True)).grid(row=2, column=6, columnspan=2, pady=2, sticky="we")
+        inv = ttk.Frame(self.mix_frame)
+        inv.grid(row=3, column=0, columnspan=8, sticky="w", pady=(4, 0))
+        ttk.Label(inv, text="Invert colours:").pack(side="left")
+        ttk.Button(inv, text="Selected", command=lambda: self.toggle_invert(False)).pack(side="left", padx=4)
+        ttk.Button(inv, text="All", command=lambda: self.toggle_invert(True)).pack(side="left")
+        ttk.Button(inv, text="Select area for selected design...", command=self.pick_item_area).pack(side="left", padx=4)
+        ttk.Button(inv, text="Clear invert", command=self.clear_invert).pack(side="left")
 
     # ---------- units / paper ----------
     def f(self, name):
@@ -791,6 +1040,12 @@ class App(tk.Tk):
         except ValueError:
             return 300.0
 
+    def _invert_dpi(self):
+        try:
+            return min(max(float(self.v["invert_dpi"].get().replace(",", ".")), 72.0), 1200.0)
+        except ValueError:
+            return 300.0
+
     def settings(self):
         s = {
             "pages": self.v["pages"].get(),
@@ -806,6 +1061,11 @@ class App(tk.Tk):
             "border": self.v["border"].get() == "1", "border_w": self.mm("border_w"),
             "scale": float(self.v["scale"].get().replace(",", ".") or 100) / 100.0,
             "grid": None,
+            "arrange": ARRANGE_MODES.get(self.v["arrange"].get(), "best"),
+            "invert_dpi": self._invert_dpi(),
+            "invert": {"full": self.v["inv_single"].get() == "1",
+                       "regions": [tuple(tuple(p) for p in r) for r in self.single_regions]},
+            "image_dpi": self.image_dpi(), "src_is_image": False,
         }
         cols = int(float(self.v["columns"].get() or 0))
         if s["mode"] == "custom" and cols > 0:
@@ -869,6 +1129,7 @@ class App(tk.Tk):
                     out, info = compose_mix(items, s)
                 else:
                     src = get_doc(path, dpi)
+                    s["src_is_image"] = is_image(path)
                     w, h = design_size_mm(src, 0)
                     meta = (len(src), w, h)
                     out, info = compose(src, s)
@@ -967,6 +1228,8 @@ class App(tk.Tk):
         if not path:
             return
         self.src_path = path
+        self.single_regions = []
+        self.area_lbl.config(text="Areas: 0")
         self.preview_index = 0
         self.file_lbl.config(text="Loading...")
         self.rebuild()
@@ -1002,7 +1265,8 @@ class App(tk.Tk):
                             name = base if len(doc) == 1 else "%s  (page %d)" % (base, pi + 1)
                             w, h = design_size_mm(doc, pi)
                             new.append({"name": name, "path": path, "page": pi, "doc": doc,
-                                        "copies": 1, "scale": 1.0, "w": w, "h": h})
+                                        "copies": 1, "scale": 1.0, "w": w, "h": h,
+                                        "inv_full": False, "regions": []})
                     except Exception as e:
                         errors.append("%s\n%s" % (path, e))
             self.q.put(lambda: self._added(new, errors))
@@ -1026,7 +1290,7 @@ class App(tk.Tk):
         for i, it in enumerate(self.items):
             size = "%s x %s %s" % (self.fmt(it["w"] * it["scale"]), self.fmt(it["h"] * it["scale"]), self.unit)
             self.tree.insert("", "end", iid=str(i), values=(
-                it["name"], size, it["copies"], "%g" % (it["scale"] * 100)))
+                it["name"], size, it["copies"], "%g" % (it["scale"] * 100), self._inv_text(it)))
         keep = [i for i in keep if self.tree.exists(i)]
         if keep:
             self.tree.selection_set(keep)
@@ -1064,6 +1328,78 @@ class App(tk.Tk):
         self.items = []
         self.refresh_table()
         self.rebuild()
+
+    # ---------- colour inversion ----------
+    def _inv_text(self, it):
+        full, area = it.get("inv_full"), bool(it.get("regions"))
+        return "Full+Area" if (full and area) else "Full" if full else "Area" if area else "-"
+
+    def toggle_invert(self, everything):
+        ids = list(range(len(self.items))) if everything else [int(i) for i in self.tree.selection()]
+        if not ids:
+            messagebox.showinfo("Invert", "Select a design in the list first (or use 'All').")
+            return
+        turn_on = not all(self.items[i].get("inv_full") for i in ids)
+        for i in ids:
+            self.items[i]["inv_full"] = turn_on
+        self.refresh_table()
+        self.rebuild()
+
+    def clear_invert(self):
+        sel = [int(i) for i in self.tree.selection()]
+        for i in (sel or range(len(self.items))):
+            self.items[i]["inv_full"] = False
+            self.items[i]["regions"] = []
+        self.refresh_table()
+        self.rebuild()
+
+    def _open_selector(self, path, page_no, regions, base_inverted, on_done):
+        """Renders the design in the background, then shows the selection window."""
+        dpi = self.image_dpi()
+        self.status.config(text="Preparing selection window...", foreground="#555")
+
+        def work():
+            try:
+                with FITZ_LOCK:
+                    doc = get_doc(path, dpi)
+                    pno = page_no if page_no is not None else parse_pages(self.v["pages"].get(), len(doc))[0]
+                    img = render_preview(doc, pno, 1100)
+                self.q.put(lambda: (self.status.config(text="Select the area, then press Done", foreground="#555"),
+                                    AreaSelector(self, img, regions, base_inverted, on_done)))
+            except Exception as e:
+                err = str(e)
+                self.q.put(lambda: self.status.config(text="Problem: %s" % err, foreground="#b00020"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def pick_single_area(self):
+        if not self.src_path:
+            messagebox.showinfo("Select area", "Open a PDF or image first.")
+            return
+
+        def done(regions):
+            self.single_regions = regions
+            self.area_lbl.config(text="Areas: %d" % len(regions))
+            self.rebuild()
+        self._open_selector(self.src_path, None, self.single_regions,
+                            self.v["inv_single"].get() == "1", done)
+
+    def clear_single_area(self):
+        self.single_regions = []
+        self.area_lbl.config(text="Areas: 0")
+        self.rebuild()
+
+    def pick_item_area(self):
+        sel = self.tree.selection()
+        if len(sel) != 1:
+            messagebox.showinfo("Select area", "Select exactly ONE design in the list first.")
+            return
+        it = self.items[int(sel[0])]
+
+        def done(regions, it=it):
+            it["regions"] = regions
+            self.refresh_table()
+            self.rebuild()
+        self._open_selector(it["path"], it["page"], it["regions"], bool(it.get("inv_full")), done)
 
     # ---------- save / print ----------
     def save_pdf(self):
